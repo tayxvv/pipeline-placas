@@ -1,52 +1,119 @@
 import os
-import io
 import cv2
+import json
 import asyncio
 import logging
+import urllib.request
 import numpy as np
 from dotenv import load_dotenv
+from datetime import datetime, timezone
 
-from utils.helpers import iso_now, to_json_bytes, build_result_paths
-from detection.preprocess import preprocess_bgr
 from detection.detector import PlateDetector
-from storage.azure_io import AzureBlobIO
-from bus.service_bus import BusConsumer
+from azure.servicebus.aio import ServiceBusClient, AutoLockRenewer
+from azure.servicebus.exceptions import MessageLockLostError
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-log = logging.getLogger("worker")
+log = logging.getLogger("worker-local")
 
-# -------- Config --------
+# ----- env -----
 load_dotenv()
+RESULTS_DIR  = os.getenv("RESULTS_DIR", "./outputs")
+MODEL_PATH   = os.getenv("LPR_MODEL_PATH", "runs/detect/train/weights/best.pt")
+LPR_CONF     = float(os.getenv("LPR_CONF", "0.25"))
+LPR_IOU      = float(os.getenv("LPR_IOU", "0.45"))
+SB_CONN      = os.getenv("AZURE_SERVICEBUS_CONNECTION_STRING")
+SB_QUEUE     = os.getenv("AZURE_SERVICEBUS_QUEUE", "processar")
 
-SB_CONN = os.getenv("AZURE_SERVICEBUS_CONNECTION_STRING")
-SB_QUEUE = os.getenv("AZURE_SERVICEBUS_QUEUE", "processar")
-BLOB_CONN = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-
-RESULTS_CONTAINER = os.getenv("RESULTS_CONTAINER", "uploadsvideos")
-RESULTS_PREFIX    = os.getenv("RESULTS_PREFIX", "results")
-SAVE_CROPS        = os.getenv("SAVE_CROPS", "true").lower() == "true"
-SAVE_ANNOTATED    = os.getenv("SAVE_ANNOTATED", "true").lower() == "true"
-
-MODEL_PATH = os.getenv("LPR_MODEL_PATH")
-LPR_CONF   = float(os.getenv("LPR_CONF", "0.25"))
-LPR_IOU    = float(os.getenv("LPR_IOU", "0.45"))
-
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
-
-# -------- Services --------
-blobio = AzureBlobIO(BLOB_CONN)
+# ----- detector -----
 detector = PlateDetector(weights_path=MODEL_PATH, conf=LPR_CONF, iou=LPR_IOU)
-consumer = BusConsumer(SB_CONN, SB_QUEUE)
 
-# -------- Handler --------
+# ----- helpers -----
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def save_json(path: str, obj: dict):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def save_image(path: str, img_bgr: np.ndarray, quality: int = 95):
+    ensure_dir(os.path.dirname(path))
+    ext = os.path.splitext(path)[1].lower() or ".jpg"
+    params = [cv2.IMWRITE_JPEG_QUALITY, quality] if ext in [".jpg", ".jpeg"] else []
+    _, enc = cv2.imencode(ext, img_bgr, params)
+    with open(path, "wb") as f:
+        f.write(enc.tobytes())
+
+def download_image_http(url: str) -> np.ndarray:
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        data = resp.read()
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Falha ao decodificar imagem baixada.")
+    return img
+
+# ----- BUS -----
+class BusConsumer:
+    def __init__(self, conn_str: str, queue_name: str):
+        self.client = ServiceBusClient.from_connection_string(conn_str)
+        self.queue_name = queue_name
+
+    @staticmethod
+    def _body_to_bytes(body) -> bytes:
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            return bytes(body)
+        try:
+            return b"".join(
+                part if isinstance(part, (bytes, bytearray, memoryview)) else bytes(part)
+                for part in body
+            )
+        except TypeError:
+            if isinstance(body, str):
+                return body.encode("utf-8")
+            raise
+
+    async def start(self, on_message, max_concurrency: int = 2):
+        async with self.client:
+            receiver = self.client.get_queue_receiver(
+                queue_name=self.queue_name,
+                prefetch_count=max(1, max_concurrency * 2),
+                max_wait_time=5,
+            )
+            async with receiver, AutoLockRenewer() as renewer:
+                log.info("Starting message loop...")
+                async for msg in receiver:
+                    renewer.register(receiver, msg, max_lock_renewal_duration=600)
+                    try:
+                        body_bytes = self._body_to_bytes(msg.body)
+                        data = json.loads(body_bytes.decode("utf-8"))
+                        await on_message(data)
+                        await receiver.complete_message(msg)
+                    except MessageLockLostError:
+                        log.warning("Message lock lost; will be redelivered.")
+                    except Exception as e:
+                        log.exception("Processing failed; dead-lettering message.")
+                        try:
+                            await receiver.dead_letter_message(
+                                msg,
+                                reason="processing_failed",
+                                error_description=str(e)[:4096],
+                            )
+                        except MessageLockLostError:
+                            log.warning("Could not DLQ: lock lost; letting it requeue.")
+
+# ----- handler -----
 async def handle_message(msg: dict):
     """
-    Mensagem esperada (exemplo):
+    Espera payload padrão:
     {
-      "BlobUrl": "https://uploadsvideos.blob.core.windows.net/uploadsvideos/cameras/1/videoteste/frame_0010.jpg",
+      "BlobUrl": "https://.../uploadsvideos/cameras/1/videoteste/frame_0010.jpg",
       "BlobPath": "cameras/1/videoteste/frame_0010.jpg",
       "Container": "uploadsvideos",
       "CameraId": "1",
@@ -55,92 +122,55 @@ async def handle_message(msg: dict):
       "CapturedAtUtc": "2025-10-08T13:19:54.0759989+00:00"
     }
     """
-    container = msg.get("Container", "")
-    blob_path = msg.get("BlobPath", "")
-    blob_url  = msg.get("BlobUrl", None)
+    blob_url  = msg.get("BlobUrl") + '?sp=r&amp;st=2025-11-03T11:42:13Z&amp;se=2026-03-14T19:57:13Z&amp;spr=https&amp;sv=2024-11-04&amp;sr=c&amp;sig=M%2FEppzitlKlHCnBpX1kHSu%2FPovfzo848F%2BHojLCCulM%3D'
+    blob_path = msg.get("BlobPath")
+    camera_id = str(msg.get("CameraId", "unknown"))
+    frame_fn  = msg.get("FrameFileName", "frame.jpg")
 
-    # Resolve container/path a partir de url/path
-    container, blob_path = blobio.parse_url_or_path(container, blob_path, blob_url)
-    log.info(f"Processing frame: {container}/{blob_path}")
+    # 1) Baixar frame
+    img_bgr = download_image_http(blob_url)
 
-    # Baixar bytes + metadata (para poder marcar processed=yes depois)
-    img_bytes, meta = blobio.download_bytes(container, blob_path)
+    # 2) Detecção somente de regiões com placa
+    dets = detector.detect(img_bgr)
+    annotated = detector.draw_annotations(img_bgr, dets)
+    crops = detector.crop_regions(img_bgr, dets)
 
-    # Decodificar imagem
-    img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
-    img_bgr = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        raise ValueError("Falha ao decodificar imagem (cv2.imdecode retornou None).")
+    # 3) Montar paths locais baseados em BlobPath
+    base_dir   = os.path.join(RESULTS_DIR, os.path.dirname(blob_path or f"cameras/{camera_id}/unknown"))
+    base_name  = os.path.splitext(frame_fn)[0]
+    json_path  = os.path.join(base_dir, f"{base_name}.json")
+    ann_path   = os.path.join(base_dir, f"{base_name}_annotated.jpg")
+    crop_fmt   = os.path.join(base_dir, f"{base_name}_lp_{{i}}.jpg")
 
-    # Pré-processamento
-    img_prep = preprocess_bgr(img_bgr)
-
-    # Detecção
-    dets = detector.detect(img_prep)
-
-    # Anotações + crops
-    annotated_bgr = detector.draw_annotations(img_prep, dets) if SAVE_ANNOTATED else None
-    crops = detector.crop_regions(img_prep, dets) if SAVE_CROPS else []
-
-    # Paths para salvar resultado
-    json_path, ann_path, crop_fmt = build_result_paths(blob_path, RESULTS_PREFIX)
-
-    # Monta JSON de saída
-    result = {
+    # 4) Salvar resultados locais
+    out = {
         "source": {
-            "container": container,
+            "blob_url": blob_url,
             "blob_path": blob_path,
-            "camera_id": msg.get("CameraId"),
+            "camera_id": camera_id,
             "video_file": msg.get("VideoFileName"),
-            "frame_file": msg.get("FrameFileName"),
+            "frame_file": frame_fn,
             "captured_at_utc": msg.get("CapturedAtUtc"),
         },
         "analysis": {
-            "detector": "yolo" if detector.use_yolo else "opencv_fallback",
+            "detector": "yolov8",
             "num_detections": len(dets),
-            "detections": dets
+            "detections": dets  # bbox, conf_det, class_id, label
         },
         "processed_at_utc": iso_now(),
-        "version": "1.0.0"
+        "version": "1.2.0-local-no-ocr"
     }
-
-    # Upload JSON
-    blobio.upload_bytes(
-        RESULTS_CONTAINER, json_path, to_json_bytes(result),
-        content_type="application/json",
-        metadata={"type": "license_plate_detections"}
-    )
-
-    # Upload Annotated
-    if annotated_bgr is not None:
-        _, enc = cv2.imencode(".jpg", annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        blobio.upload_bytes(
-            RESULTS_CONTAINER, ann_path, enc.tobytes(),
-            content_type="image/jpeg",
-            metadata={"annotated": "yes"}
-        )
-
-    # Upload crops
+    save_json(json_path, out)
+    save_image(ann_path, annotated, quality=92)
     for i, crop in enumerate(crops):
-        _, enc = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        crop_path = crop_fmt.format(i=i)
-        blobio.upload_bytes(
-            RESULTS_CONTAINER, crop_path, enc.tobytes(),
-            content_type="image/jpeg",
-            metadata={"kind": "plate_crop", "index": str(i)}
-        )
+        save_image(crop_fmt.format(i=i), crop, quality=95)
 
-    # Marcar o blob de origem como processado (opcional, ajuda na idempotência)
-    try:
-        blobio.set_metadata(container, blob_path, {"processed": "yes"})
-    except Exception:
-        log.warning("Não foi possível atualizar metadata do blob de origem.", exc_info=True)
+    log.info(f"OK: {json_path}")
 
-    log.info(f"Done: {container}/{blob_path} -> {RESULTS_CONTAINER}/{json_path}")
-
-# -------- Main --------
+# ----- main -----
 async def main():
-    await consumer.start(on_message=handle_message, max_concurrency=MAX_CONCURRENCY)
+    consumer = BusConsumer(SB_CONN, SB_QUEUE)
+    await consumer.start(on_message=handle_message, max_concurrency=2)
 
 if __name__ == "__main__":
     asyncio.run(main())
